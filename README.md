@@ -13,3 +13,9 @@ Here's a breakdown of how this framework would operates:
 2. **Approval Governor**: This Governor handles proposals in their initial stages, requiring a simple approval threshold (or a designated set of approvers, 2/3) before progressing further. Focus on WHY we should go forward with the proposal.
 3. **Quadratic Governor**: This Governor type, implemented using quadratic voting, is employed in the later stages of a proposal, allowing for more nuanced and weighted voting based on participants' preference intensity. Focus on HOW MUCH resources we should allocate and HOW we should implement the proposal.
 
+One of the key limitions among the existing DAOs, in our opinion, is each proposal general stands on its own when, in reality, proposals should be batched together over a single voting period. A proposal should be analogous to electing an official policy-maker/executive, because of Bounded Rationality due to resource limitation, such as Time, Attention, and Information, as well as money and manpower. This means, with a given fiscal period, such as 3 months, there should only be 1 major voting process for everyone to review, discuss, and decide what to move forward with.  
+
+Comparison with major DAO Platforms: 
+- Aragon: 
+- DAOStack
+- Colony
