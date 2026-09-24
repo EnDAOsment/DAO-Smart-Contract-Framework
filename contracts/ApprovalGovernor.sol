@@ -2,29 +2,49 @@
 // Compatible with OpenZeppelin Contracts ^5.0.0
 pragma solidity ^0.8.27;
 
-import {GovernorUpgradeable} from "@openzeppelin/contracts-upgradeable/governance/GovernorUpgradeable.sol";
-import {GovernorCountingSimpleUpgradeable} from "@openzeppelin/contracts-upgradeable/governance/extensions/GovernorCountingSimpleUpgradeable.sol";
-import {GovernorSettingsUpgradeable} from "@openzeppelin/contracts-upgradeable/governance/extensions/GovernorSettingsUpgradeable.sol";
-import {GovernorStorageUpgradeable} from "@openzeppelin/contracts-upgradeable/governance/extensions/GovernorStorageUpgradeable.sol";
-import {GovernorTimelockControlUpgradeable} from "@openzeppelin/contracts-upgradeable/governance/extensions/GovernorTimelockControlUpgradeable.sol";
-import {GovernorVotesUpgradeable} from "@openzeppelin/contracts-upgradeable/governance/extensions/GovernorVotesUpgradeable.sol";
-import {GovernorVotesQuorumFractionUpgradeable} from "@openzeppelin/contracts-upgradeable/governance/extensions/GovernorVotesQuorumFractionUpgradeable.sol";
-import {IVotes} from "@openzeppelin/contracts/governance/utils/IVotes.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import {TimelockControllerUpgradeable} from "@openzeppelin/contracts-upgradeable/governance/TimelockControllerUpgradeable.sol";
+import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import "./MemberToken.sol";
 import "./ICrsManager.sol";
+import "./IStageGovernor.sol";
 
 /**
  * @title ApprovalGovernor
- * @dev This governor handles the initial "why" of a proposal.
- * It uses a simple approval voting system where the sum of Contribution
- * Reputation Scores of "For" votes must exceed a threshold.
+ * @dev Governance module for Stage 1: Proposal (Value) Ranking (Approval Voting).
+ * Votes are weighted by the voter's Contribution Reputation Score (CRS) snapshot.
  */
-abstract contract ApprovalGovernor is Initializable, GovernorUpgradeable, GovernorSettingsUpgradeable, GovernorCountingSimpleUpgradeable, GovernorTimelockControlUpgradeable, UUPSUpgradeable {
+contract ApprovalGovernor is Initializable, OwnableUpgradeable, UUPSUpgradeable, IStageGovernor {
+    struct ProposalVote {
+        uint256 forVotes;
+        uint256 againstVotes;
+        uint256 abstainVotes;
+        mapping(address => bool) hasVoted;
+    }
+
+    ERC1155TokenUpgradeable public memberToken;
     ICrsManager public crsManager;
-    IERC721 public nft;
+    address public governorGeneral;
+    uint256 public quorumScore;
+
+    mapping(uint256 => ProposalVote) private _proposalVotes;
+
+    event ApprovalVoteCast(address indexed voter, uint256 indexed proposalId, uint8 support, uint256 weight);
+    event QuorumScoreUpdated(uint256 oldQuorumScore, uint256 newQuorumScore);
+    event GovernorGeneralUpdated(address indexed oldGovernorGeneral, address indexed newGovernorGeneral);
+
+    error OnlyGovernorGeneral();
+    error AlreadyVoted();
+    error NotMember();
+    error InvalidVoteChoice();
+    error ZeroAddress();
+
+    modifier onlyGovernorGeneral() {
+        if (msg.sender != governorGeneral && msg.sender != owner()) {
+            revert OnlyGovernorGeneral();
+        }
+        _;
+    }
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -32,72 +52,133 @@ abstract contract ApprovalGovernor is Initializable, GovernorUpgradeable, Govern
     }
 
     function initialize(
-        string memory _name,
+        address _owner,
+        address _memberToken,
         address _crsManager,
-        address _nft,
-        TimelockControllerUpgradeable _timelock,
-        uint32 _votingPeriod,
-        uint48 _proposalThreshold
+        uint256 _quorumScore
     ) public initializer {
-        __Governor_init(_name);
-        __GovernorSettings_init(_proposalThreshold, _votingPeriod, 0); // initial delay is 0
-        __GovernorCountingSimple_init();
-        __GovernorTimelockControl_init(_timelock);
-        __UUPSUpgradeable_init();
+        if (_owner == address(0) || _memberToken == address(0) || _crsManager == address(0)) {
+            revert ZeroAddress();
+        }
+        __Ownable_init(_owner);
+
+        memberToken = ERC1155TokenUpgradeable(_memberToken);
         crsManager = ICrsManager(_crsManager);
-        nft = IERC721(_nft);
+        quorumScore = _quorumScore;
+    }
+
+    function setGovernorGeneral(address _governorGeneral) external onlyOwner {
+        if (_governorGeneral == address(0)) revert ZeroAddress();
+        address old = governorGeneral;
+        governorGeneral = _governorGeneral;
+        emit GovernorGeneralUpdated(old, _governorGeneral);
+    }
+
+    function setQuorumScore(uint256 _quorumScore) external onlyOwner {
+        uint256 old = quorumScore;
+        quorumScore = _quorumScore;
+        emit QuorumScoreUpdated(old, _quorumScore);
     }
 
     /**
-     * @notice Allows a user to cast a vote using a specific NFT as their voting power.
-     * @param proposalId The ID of the proposal to vote on.
-     * @param support The choice for the vote (For, Against, Abstain).
-     * @param nftId The ID of the NFT to use for calculating voting power.
-     * @return The weight of the vote cast.
+     * @notice Returns stage identifier (1 = Approval).
      */
-    function castVoteWithNft(uint256 proposalId, uint8 support, uint256 nftId) public returns (uint256) {
-        require(msg.sender == _msgSender(), "Only the intended voter should vote.");
-        return _castVote(proposalId, _msgSender(), support, abi.encode(nftId));
+    function stageId() external pure override returns (uint8) {
+        return 1;
     }
 
-    function _castVote(uint256 proposalId, address account, uint8 support, bytes memory params) internal virtual returns (uint256) {
-        // Get the voting weight based on the user's reputation score and the specific NFT.
-        // This is where your custom logic for reputation-based voting power comes in.
-        // uint256 weight = crsManager.getContributionReputationScore(account, nftId);
-        uint256 weight = _getVoteWeight(account, params); // Placeholder until crsManager.getContributionReputationScore is developed 
-        require(weight > 0, "ApprovalGovernor: Voter has no reputation score or NFT is not valid for voting");
+    /**
+     * @notice Casts an approval vote for a proposal.
+     * @param proposalId The ID of the proposal.
+     * @param voter The address of the voter.
+     * @param support 0 = Against, 1 = For, 2 = Abstain.
+     * @param tokenId The ERC1155 member badge token ID.
+     * @param snapshot The snapshot block number for balance check.
+     */
+    function castVote(
+        uint256 proposalId,
+        address voter,
+        uint8 support,
+        uint256 tokenId,
+        uint256 snapshot
+    ) external onlyGovernorGeneral returns (uint256) {
+        if (support > 2) revert InvalidVoteChoice();
 
-        // Use the internal _countVote provided by GovernorCountingSimpleUpgradeable
-        // ADDED THE FIFTH ARGUMENT: abi.encode() for empty bytes
-        // _countVote(proposalId, account, support, weight, abi.encode());
-        _countVote(proposalId, account, support, weight, params);
+        ProposalVote storage pv = _proposalVotes[proposalId];
+        if (pv.hasVoted[voter]) revert AlreadyVoted();
 
-        // Emit the standard VoteCast event
-        emit VoteCast(account, proposalId, support, weight, ""); // reason is empty string as we use nftId
+        // Verify membership at snapshot block
+        uint256 balance = memberToken.getPastBalanceOf(voter, tokenId, snapshot);
+        if (balance == 0) revert NotMember();
+
+        // Calculate vote weight based on snapshot CRS (immune to post-proposal score change)
+        uint256 score = crsManager.getPastCrs(voter, tokenId, snapshot);
+        // Default base weight of 1e18 if score is 0
+        uint256 weight = score > 0 ? score : 1e18;
+
+        pv.hasVoted[voter] = true;
+
+        if (support == 0) {
+            pv.againstVotes += weight;
+        } else if (support == 1) {
+            pv.forVotes += weight;
+        } else {
+            pv.abstainVotes += weight;
+        }
+
+        emit ApprovalVoteCast(voter, proposalId, support, weight);
         return weight;
     }
 
-    function _getVoteWeight(address account, bytes memory params) internal view returns (uint256) {
-        uint256 nftId = abi.decode(params, (uint256));
-        require(nft.ownerOf(nftId) == account, "AG: Voter does not own NFT");
-
-        uint256 score = crsManager.getCrs(nftId);
-        // The score is scaled by 1000 to handle decimals, as it's between 0.5 and 2.
-        uint256 weight = (score * 1000) / 1e18;
-        return weight;
+    function hasVoted(uint256 proposalId, address account) external view returns (bool) {
+        return _proposalVotes[proposalId].hasVoted[account];
     }
 
-    function _authorizeUpgrade(address newImplementation) internal override onlyGovernance {}
-    
-    // The following functions are overrides required by Solidity.
-    function state(uint256 proposalId) public view override(GovernorUpgradeable, GovernorTimelockControlUpgradeable) returns (ProposalState) { return super.state(proposalId); }
-    function proposalNeedsQueuing(uint256 proposalId) public view override(GovernorUpgradeable, GovernorTimelockControlUpgradeable) returns (bool) { return super.proposalNeedsQueuing(proposalId); }
-    function _queueOperations(uint256 proposalId, address[] memory targets, uint256[] memory values, bytes[] memory calldatas, bytes32 descriptionHash) internal override(GovernorUpgradeable, GovernorTimelockControlUpgradeable) returns (uint48) { return super._queueOperations(proposalId, targets, values, calldatas, descriptionHash); }
-    function _executeOperations(uint256 proposalId, address[] memory targets, uint256[] memory values, bytes[] memory calldatas, bytes32 descriptionHash) internal override(GovernorUpgradeable, GovernorTimelockControlUpgradeable) { super._executeOperations(proposalId, targets, values, calldatas, descriptionHash); }
-    function _cancel(address[] memory targets, uint256[] memory values, bytes[] memory calldatas, bytes32 descriptionHash) internal override(GovernorUpgradeable, GovernorTimelockControlUpgradeable) returns (uint256) { return super._cancel(targets, values, calldatas, descriptionHash); }
-    function _executor() internal view override(GovernorUpgradeable, GovernorTimelockControlUpgradeable) returns (address) { return super._executor(); }
-    
-    function proposalThreshold() public view override(GovernorUpgradeable, GovernorSettingsUpgradeable) returns (uint256) {
-        return super.proposalThreshold();
+    function getVotes(uint256 proposalId)
+        external
+        view
+        override
+        returns (uint256 forVotes, uint256 againstVotes, uint256 abstainVotes)
+    {
+        ProposalVote storage pv = _proposalVotes[proposalId];
+        return (pv.forVotes, pv.againstVotes, pv.abstainVotes);
     }
+
+    function hasPassed(uint256 proposalId) external view override returns (bool) {
+        ProposalVote storage pv = _proposalVotes[proposalId];
+        return (pv.forVotes >= quorumScore && pv.forVotes > pv.againstVotes);
+    }
+
+    /**
+     * @notice Current timepoint synced from MemberToken with safe fallback.
+     */
+    function clock() public view virtual override returns (uint48) {
+        if (address(memberToken).code.length > 0) {
+            try memberToken.clock() returns (uint48 timepoint) {
+                return timepoint;
+            } catch {
+                return uint48(block.number);
+            }
+        }
+        return uint48(block.number);
+    }
+
+    /**
+     * @notice Description of the clock mode synced from MemberToken with safe fallback.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function CLOCK_MODE() public view virtual override returns (string memory) {
+        if (address(memberToken).code.length > 0) {
+            try memberToken.CLOCK_MODE() returns (string memory mode) {
+                return mode;
+            } catch {
+                return "mode=blocknumber&finality=finalized";
+            }
+        }
+        return "mode=blocknumber&finality=finalized";
+    }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+
+    uint256[49] private __gap;
 }

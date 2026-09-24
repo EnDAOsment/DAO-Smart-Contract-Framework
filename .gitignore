@@ -13,3 +13,11 @@ states/
 # Optional
 .env
 .env.local
+# Foundry
+out/
+cache/
+
+# Node
+node_modules/
+broadcast/
+.deps/
